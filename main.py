@@ -1,21 +1,20 @@
 """
-FF_70A Top Up server (FastAPI + SQLite).
+FF_70A Redeem Code server (FastAPI + SQLite).
 
-Flow (manual verification — there is no payment gateway yet):
-  1. Player taps BUY/JOIN in the game, scans the owner's UPI QR,
-     pays in any UPI app, enters the 12-digit UTR and submits.
-  2. The claim is stored here as PENDING. NO diamonds are given yet.
-  3. The owner opens /admin, checks the payment in GPay/bank
-     (match the UTR + amount), and taps APPROVE or REJECT.
-  4. The player's app polls /api/claims/mine — an APPROVED claim
-     releases the diamonds into the mailbox (packs) or activates
-     the membership (7-day daily rewards).
+Flow (no payments — redeem codes only):
+  1. The owner creates a redeem code on /admin (code + diamonds).
+     A code works exactly ONCE, for one player.
+  2. A player enters the code in the game's Redeem screen.
+  3. POST /api/redeem validates the code: unknown code -> 404,
+     already-used code -> 409. A valid unused code is marked used
+     (by that player's UID) and the diamonds are returned — the app
+     adds them to the balance straight away.
 
 Run locally:  uvicorn main:app --reload --port 8000
 Deploy: Render free web service (render.yaml in this folder).
-NOTE: Render Free has no persistent disk — claims survive
+NOTE: Render Free has no persistent disk — codes survive
 spin-downs but are wiped on redeploy. Move to Postgres later
-if claims must never be lost.
+if codes must never be lost.
 """
 import os
 import sqlite3
@@ -26,37 +25,38 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "70a-7K2m-9Qx4")
-DB_PATH = os.environ.get("DB_PATH", "claims.db")
+DB_PATH = os.environ.get("DB_PATH", "redeem.db")
 
-app = FastAPI(title="FF_70A Top Up Server")
+app = FastAPI(title="FF_70A Redeem Server")
 
 
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute(
-        """CREATE TABLE IF NOT EXISTS claims (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uid TEXT NOT NULL,
-            name TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            rupees INTEGER NOT NULL,
+        """CREATE TABLE IF NOT EXISTS redeem_codes (
+            code TEXT PRIMARY KEY,
             diamonds INTEGER NOT NULL,
-            utr TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
+            used_by TEXT,
+            used_at INTEGER,
             created_at INTEGER NOT NULL)"""
     )
     conn.commit()
     return conn
 
 
-class ClaimIn(BaseModel):
+def norm_code(code: str) -> str:
+    return code.strip().upper()
+
+
+class RedeemIn(BaseModel):
     uid: str
-    name: str
-    kind: str  # "pack" or "membership"
-    rupees: int
+    code: str
+
+
+class CodeIn(BaseModel):
+    code: str
     diamonds: int
-    utr: str
 
 
 @app.get("/health")
@@ -64,33 +64,35 @@ def health():
     return {"ok": True}
 
 
-@app.post("/api/claims")
-def create_claim(c: ClaimIn):
-    if c.kind not in ("pack", "membership"):
-        raise HTTPException(status_code=400, detail="bad kind")
-    utr = c.utr.strip()
-    if len(utr) < 6:
-        raise HTTPException(status_code=400, detail="UTR chahiye")
+@app.post("/api/redeem")
+def redeem(r: RedeemIn):
+    code = norm_code(r.code)
+    uid = r.uid.strip()
+    if len(code) < 4:
+        raise HTTPException(status_code=400, detail="Galat code")
+    if not uid:
+        raise HTTPException(status_code=400, detail="UID chahiye")
     conn = db()
+    row = conn.execute(
+        "SELECT * FROM redeem_codes WHERE code=?", (code,)
+    ).fetchone()
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Galat code")
+    if row["used_by"]:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Code pehle se use ho chuka hai")
+    # Atomic claim: only one player can win the race for this code.
     cur = conn.execute(
-        "INSERT INTO claims (uid, name, kind, rupees, diamonds, utr, status, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
-        (c.uid, c.name, c.kind, c.rupees, c.diamonds, utr, int(time.time())),
+        "UPDATE redeem_codes SET used_by=?, used_at=? "
+        "WHERE code=? AND used_by IS NULL",
+        (uid, int(time.time()), code),
     )
     conn.commit()
-    cid = cur.lastrowid
     conn.close()
-    return {"ok": True, "id": cid, "status": "pending"}
-
-
-@app.get("/api/claims/mine")
-def my_claims(uid: str):
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM claims WHERE uid=? ORDER BY id DESC LIMIT 50", (uid,)
-    ).fetchall()
-    conn.close()
-    return {"claims": [dict(r) for r in rows]}
+    if cur.rowcount != 1:
+        raise HTTPException(status_code=409, detail="Code pehle se use ho chuka hai")
+    return {"ok": True, "diamonds": row["diamonds"]}
 
 
 def _require_admin(key: str):
@@ -98,32 +100,46 @@ def _require_admin(key: str):
         raise HTTPException(status_code=403, detail="wrong key")
 
 
-@app.get("/api/claims/pending")
-def pending(key: str = Query("")):
+@app.get("/api/codes")
+def list_codes(key: str = Query("")):
     _require_admin(key)
     conn = db()
     rows = conn.execute(
-        "SELECT * FROM claims WHERE status='pending' ORDER BY id DESC"
+        "SELECT * FROM redeem_codes ORDER BY created_at DESC"
     ).fetchall()
     conn.close()
-    return {"claims": [dict(r) for r in rows]}
+    return {"codes": [dict(r) for r in rows]}
 
 
-@app.post("/api/claims/{cid}/approve")
-def approve(cid: int, key: str = Query("")):
+@app.post("/api/codes")
+def create_code(c: CodeIn, key: str = Query("")):
     _require_admin(key)
+    code = norm_code(c.code)
+    if len(code) < 4 or len(code) > 32 or c.diamonds <= 0 or c.diamonds > 100000:
+        raise HTTPException(
+            status_code=400,
+            detail="Code 4-32 characters, diamonds 1-100000",
+        )
     conn = db()
-    conn.execute("UPDATE claims SET status='approved' WHERE id=?", (cid,))
-    conn.commit()
+    try:
+        conn.execute(
+            "INSERT INTO redeem_codes (code, diamonds, used_by, used_at, created_at)"
+            " VALUES (?, ?, NULL, NULL, ?)",
+            (code, c.diamonds, int(time.time())),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Ye code pehle se hai")
     conn.close()
-    return {"ok": True}
+    return {"ok": True, "code": code, "diamonds": c.diamonds}
 
 
-@app.post("/api/claims/{cid}/reject")
-def reject(cid: int, key: str = Query("")):
+@app.post("/api/codes/{code}/delete")
+def delete_code(code: str, key: str = Query("")):
     _require_admin(key)
     conn = db()
-    conn.execute("UPDATE claims SET status='rejected' WHERE id=?", (cid,))
+    conn.execute("DELETE FROM redeem_codes WHERE code=?", (norm_code(code),))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -131,21 +147,28 @@ def reject(cid: int, key: str = Query("")):
 
 ADMIN_HTML = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FF_70A — Top Up Approvals</title>
+<title>FF_70A — Redeem Codes</title>
 <style>
 body{background:#10101a;color:#fff;font-family:sans-serif;margin:0;padding:16px}
 h1{color:#ffc93c;font-size:22px}
+h2{color:#ffc93c;font-size:18px;margin-top:20px}
 input,button{font-size:16px;padding:10px 14px;border-radius:10px;border:1px solid #c9a227}
-input{background:#1e1e30;color:#fff;width:220px}
+input{background:#1e1e30;color:#fff;width:200px}
 button{background:#ffc93c;color:#4a3200;font-weight:bold;border:none;cursor:pointer;margin-left:6px}
 .card{background:#1e1e30;border:1px solid #c9a227;border-radius:12px;padding:14px;margin:12px 0}
 .card b{color:#ffc93c}
 .small{color:#aaa;font-size:13px}
+.used{color:#ff7777}
+.free{color:#77ff99}
 </style></head><body>
-<h1>FF_70A — Top Up Approvals</h1>
-<p class="small">Pehle GPay/bank me UTR + amount check karo, phir APPROVE dabao. Approve karte hi player ke mailbox me diamonds aa jayenge.</p>
+<h1>FF_70A — Redeem Codes</h1>
+<p class="small">Code banao aur player ko do — player game me code daalega aur diamonds mil jayenge. Ek code ek baar hi chalega.</p>
 <label>Admin key: <input id="key" type="password" placeholder="admin key"></label>
-<button onclick="load()">Load pending</button>
+<button onclick="load()">Load codes</button>
+<h2>Naya code banao</h2>
+<input id="newCode" placeholder="CODE likho, jaise FF70A-100">
+<input id="newDiamonds" type="number" placeholder="Diamonds" style="width:120px">
+<button onclick="createCode()">CREATE</button>
 <div id="list"></div>
 <script>
 const keyInput = document.getElementById('key');
@@ -153,22 +176,29 @@ keyInput.value = localStorage.getItem('adminKey') || '';
 async function load(){
   const key = keyInput.value;
   localStorage.setItem('adminKey', key);
-  const r = await fetch('/api/claims/pending?key=' + encodeURIComponent(key));
+  const r = await fetch('/api/codes?key=' + encodeURIComponent(key));
   if(!r.ok){ document.getElementById('list').innerHTML = '<p>Wrong key ya server error.</p>'; return; }
   const data = await r.json();
   const list = document.getElementById('list');
-  if(!data.claims.length){ list.innerHTML = '<p>No pending claims.</p>'; return; }
-  list.innerHTML = data.claims.map(c =>
-    `<div class="card"><b>${c.name}</b> (${c.uid})<br>
-     ${c.kind === 'membership' ? 'Membership' : 'Pack'} — Rs ${c.rupees} — ◆ ${c.diamonds}<br>
-     UTR: <b>${c.utr}</b><br>
+  if(!data.codes.length){ list.innerHTML = '<p>Abhi koi code nahi hai.</p>'; return; }
+  list.innerHTML = data.codes.map(c =>
+    `<div class="card"><b>${c.code}</b> — ◆ ${c.diamonds}<br>
+     ${c.used_by ? `<span class="used">USED by ${c.used_by}</span>` : '<span class="free">Unused</span>'}<br>
      <span class="small">${new Date(c.created_at*1000).toLocaleString()}</span><br><br>
-     <button onclick="decide(${c.id},'approve')">APPROVE</button>
-     <button onclick="decide(${c.id},'reject')">REJECT</button></div>`).join('');
+     <button onclick="delCode('${c.code}')">DELETE</button></div>`).join('');
 }
-async function decide(id, action){
+async function createCode(){
   const key = keyInput.value;
-  const r = await fetch(`/api/claims/${id}/${action}?key=` + encodeURIComponent(key), {method:'POST'});
+  const code = document.getElementById('newCode').value;
+  const diamonds = parseInt(document.getElementById('newDiamonds').value, 10);
+  const r = await fetch('/api/codes?key=' + encodeURIComponent(key), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code, diamonds})});
+  if(r.ok){ document.getElementById('newCode').value=''; document.getElementById('newDiamonds').value=''; load(); }
+  else { const d = await r.json().catch(()=>({})); alert(d.detail || 'Failed'); }
+}
+async function delCode(code){
+  const key = keyInput.value;
+  if(!confirm('Delete ' + code + '?')) return;
+  const r = await fetch('/api/codes/' + encodeURIComponent(code) + '/delete?key=' + encodeURIComponent(key), {method:'POST'});
   if(r.ok) load(); else alert('Failed');
 }
 load();
